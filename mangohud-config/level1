@@ -1,0 +1,5 @@
+fps_only
+fps_color_change
+fps_value=60,144
+fps_color=B22222,FDFD09,39F900
+round_corners=10

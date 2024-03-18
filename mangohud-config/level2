@@ -1,0 +1,16 @@
+round_corners=10
+hud_no_margin
+horizontal
+horizontal_stretch=0
+background_alpha=0.3
+gpu_stats
+gpu_temp
+gpu_load_change
+cpu_stats
+cpu_temp
+cpu_load_change
+fps
+fps_color_change
+fps_value=60,144
+frametime=0
+frame_timing=0
