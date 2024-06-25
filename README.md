@@ -259,3 +259,4 @@ B4B has always crashed in my testing unless `SDL_VIDEODRIVER` contains `windows`
 
 # To-do / Possible future improvements
 - Config file for this script to pull default values from
+- Makefile to really simplify installation?
