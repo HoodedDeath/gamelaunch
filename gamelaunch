@@ -1,5 +1,24 @@
 #!/bin/bash
-echo "---------- GameLaunch Start ----------"
+# Gets the name for this script
+## Needs to be set early, as _debug_file calls this
+function _name {
+  # Expected basename -- If renaming script, change this to new name
+  _expected_bn="gamelaunch"
+  # What to change expected to -- If renaming script, change this to desired pretty name
+  _fancy_bn="GameLaunch"
+  # Get basename
+  _bn=$(basename $0)
+  # Providing an option to this function will only ever return the pure basename
+  if [[ ! -z $1 ]]; then
+    echo "$_bn"
+  # Check if basename is expected
+  elif [[ "x$_bn" == "x$_expected_bn" ]]; then
+    echo "$_fancy_bn"
+  # Fallback to pure basename
+  else
+    echo "$_bn"
+  fi
+}
 # Main Vars
 _dxvk_export="DXVK_ASYNC=1"
 _esync_export="PROTON_NO_ESYNC=1"
@@ -9,9 +28,10 @@ _gamemode_cmd="gamemoderun"
 _strangle_cmd="strangle"
 _strangle_fps_arg="-f 144"
 _strangle_vulkan_arg="-k"
+_sdl_driver=""
+_tmp_dir="/tmp"
 # Mango Vars
-_mango_tmp_dir="/tmp"
-_mango_live="${_mango_tmp_dir}/mango_conf"
+_mango_live="${_tmp_dir}/mango_conf"
 _mango_conf_dir="${XDG_CONFIG_HOME:-"${HOME}/.config"}/MangoHud"
 _mango_lx="${_mango_conf_dir}/level"
 _mango_export="MANGOHUD_CONFIGFILE=${_mango_live}"
@@ -29,6 +49,7 @@ _fsync_state=0
 _fsync_force=0
 _log_state=0
 _log_force=0
+_sdl_state=0
 _gamemode_state=0
 _gamemode_block=0
 _strangle_state=0
@@ -39,20 +60,82 @@ _mango_dlsym=0
 _mango_block=0
 _mango_level_set=0
 _mango_level=0
+_mango_force_cleanup=0
+_mango_cleanup=0
 _dry_run=0
 _full_cmd=""
 _exports=()
+# Debugging vars
+_debug_file="${_tmp_dir}/$(_name)_debug.log"
+_verbose=0
+_debug_hold=""
+_verbose_hold=""
 
 # Main Functions
+## Adds a default INFO level to a message if unspecified
+function dbglvl {
+  # String starting with "[", that's probably a log level. Mainly for detecting "[WARN]" messages
+  if [[ "$@" == "["* ]]; then
+    echo "$@"
+  # String starting with "__NODBGLVL__" currently only comes from _print_dry. Avoids prepending "[INFO]" to the first line of the dry run info block
+  elif [[ "$@" == "__NODBGLVL__"* ]]; then
+    echo "${@##"__NODBGLVL__ "}"
+  # Empty string for inserting spacing into log file. Don't want a lone "[INFO]" left there
+  elif [[ -z "$@" ]]; then
+    echo
+  # String probably doesn't have a log level declared. 'Set' it to INFO as a default
+  else
+    echo "[INFO] $@"
+  fi
+}
+## Logs to debug file
+function dbglog {
+  # Verbose logging may not be enabled yet (if we're still parsing flags), so add any messages to a buffer
+  if [[ $_verbose -eq 0 ]]; then
+    _debug_hold="$_debug_hold\n$(dbglvl "$@")"
+  else
+    # Empty our logging buffer into logging file if needed
+    if [[ ! -z "$_debug_hold" ]]; then
+      echo -e "${_debug_hold##"\n"}" > $_debug_file
+      _debug_hold=""
+    fi
+    # Log the line
+    echo "$(dbglvl "$@")" >> $_debug_file
+  fi
+}
+## Prints verbose messages
+function vmsg {
+  # Verbose logging may not be enabled yet (if we're still parsing flags), so add any messages to a buffer
+  if [[ $_verbose -eq 0 ]]; then
+    _verbose_hold="$_verbose_hold\n$(dbglvl "$@")" ##--
+  else
+    # Empty our message buffer into STDOUT if needed
+    if [[ ! -z "$_verbose_hold" ]]; then
+      echo -e "${_verbose_hold##"\n"}"
+      _verbose_hold=""
+    fi
+    # Print line
+    echo $(dbglvl "$@")
+  fi
+  # Forward line to dbglog for logging in the debug file
+  dbglog "$@"
+}
+## Prints warning
+function warn {
+  vmsg "[WARN] $@"
+}
 ## Prints to STDERR
 function echoerr {
-  cat <<< "[ERROR] $@" 1>&2
+  >&2 echo "[ERROR] $@"
+  dbglog "[ERROR] $@"
 }
 ## Attempts to enable all options
-## Used by each of the 'disable' flags to ensure all options are enabled by default
+## Used by each of the 'disable' flags to ensure default options are enabled before disabling options
+## Also used in _setup_command to enable default flags if no options have been provided
 function _try_enable_all {
-  # If none of the 'enable' flags have been read and we haven't run this function before, we set all options to enabled
+  # If none of the 'enable' flags have been read and we haven't run this function before, we set default options to enabled
   if [[ ! $_any -eq 1 ]]; then
+    vmsg "Enabling default flags"
     _any=1
     _dxvk_state=1
     _esync_state=1
@@ -60,6 +143,7 @@ function _try_enable_all {
     _gamemode_state=1
     _strangle_state=1
     _mango_state=1
+    _mango_cleanup=1
   fi
 }
 ## Reads the option flags given in the '+' argument
@@ -68,107 +152,131 @@ function _readflags {
   _array=($(echo $1 | grep -o .))
   for i in ${_array[@]}; do
     case "$i" in
-      "+");; # The + is left over at the begining of our flag array, so skip it
+      "+");; # The + is left over at the beginning of our flag array, so skip it
       ## Enabling flags
+      "i") # Enable MangoHud auto cleanup
+        vmsg "Setting MangoHud automatic cleanup on"
+        _mango_cleanup=1
+        ;;
+      "c") # Enable forced cleanup for MangoHud config file
+        vmsg "Setting MangoHud force cleanup on"
+        _mango_force_cleanup=1
+        ;;
       "d") # Enable DXVK_ASYNC export
+        vmsg "Setting DXVK_ASYNC export on"
         _dxvk_state=1
         _dxvk_force=1
         _any=1
         ;;
       "e") # Enable ESYNC export
+        vmsg "Setting PROTON_NO_ESYNC export on"
         _esync_state=1
         _esync_force=1
         _any=1
         ;;
       "f") # Enable FSYNC export
+        vmsg "Setting PROTON_NO_FSYNC export on"
         _fsync_state=1
         _fsync_force=1
         _any=1
         ;;
-      "l")
+      "l") # Enable PROTON_LOG export
+        vmsg "Setting PROTON_LOG export on"
         _log_state=1
         _log_force=1
         _any=1
         ;;
       "g") # Enable GameMode wrapper
+        vmsg "Setting GameMode wrapper on"
         _gamemode_state=1
         _any=1
         ;;
       "s") # Enable LibStrangle wrapper
+        vmsg "Setting LibStrangle wrapper on"
         _strangle_state=1
         _any=1
         ;;
       "m") # Enable MangoHud wrapper
+        vmsg "Setting MangoHud wrapper on"
         _mango_state=1
         _any=1
         ;;
       "k") # Enable Vulkan-only flag for LibStrangle
+        vmsg "Setting Vulkan only flag for LibStrangle on"
         _strangle_vulkan=1
         ;;
       "y") # Enable DLSYM flag for MangoHud
+        vmsg "Setting DLSYM flag for MangoHud on"
         _mango_dlsym=1
         ;;
       "n") # Enable dry run
+        vmsg "Setting dry run on"
         _dry_run=1
         ;;
-      ## MangoHud level flags
-      "0") # Default MangoHud to level 0
-        _mango_level_set 0
-        ;;
-      "1") # Default MangoHud to level 1
-        _mango_level_set 1
-        ;;
-      "2") # Default MangoHud to level 2
-        _mango_level_set 2
-        ;;
-      "3") # Default MangoHud to level 3
-        _mango_level_set 3
-        ;;
-      "4") # Default MangoHud to level 4
-        _mango_level_set 4
-        ;;
+      0|1|2|3|4) # MangoHud level flags
+        vmsg "Setting MangoHud level to $i"
+        _mango_level_set $i
+        ;;    
       ## Disabling flags
+      "I") # Disable MangoHud auto cleanup
+        vmsg "Setting MangoHud automatic cleanup off"
+        _try_enable_all
+        _mango_cleanup=0
+        ;;
+      "C") # Disable forced cleanup for MangoHud config file
+        vmsg "Setting MangoHud force cleanup off"
+        _try_enable_all
+        _mango_force_cleanup=0
+        ;;
       "D") # Disable DXVK_ASYNC export
+        vmsg "Setting DXVK_ASYNC export off"
         _try_enable_all
         _dxvk_state=0
         _dxvk_force=0
         ;;
       "E") # Disable ESYNC export
+        vmsg "Setting PROTON_NO_ESYNC export off"
         _try_enable_all
         _esync_state=0
         _esync_force=0
         ;;
       "F") # Disable FSYNC export
+        vmsg "Setting PROTON_NO_FSYNC export off"
         _try_enable_all
         _fsync_state=0
         _fsync_force=0
         ;;
-      "L")
+      "L") # Disable PROTON_LOG export
+        vmsg "Setting PROTON_LOG export off"
         _try_enable_all
         _log_state=0
         _log_force=0
         ;;
       "G") # Disable GameMode wrapper
+        vmsg "Setting GameMode wrapper off"
         _try_enable_all
         _gamemode_state=0
         ;;
       "S") # Disable LibStrangle wrapper
+        vmsg "Setting LibStrangle wrapper off"
         _try_enable_all
         _strangle_state=0
         ;;
       "M") # Disable MangoHud wrapper
+        vmsg "Setting MangoHud wrapper off"
         _try_enable_all
         _mango_state=0
         ;;
       "K") # Disable LibStrangle vulkan-only flag
+        vmsg "Setting LibStrangle Vulkan only flag off"
         _strangle_vulkan=0
         ;;
       "Y") #Disable DLSYM flag for MangoHud
+        vmsg "Setting DLSYM flag for MangoHud off"
         _mango_dlsym=0
         ;;
-      ## Catch to print unknown flag
-      *)
-        echo "[WARN] Unknown option flag: $i"
+      *) # Catch to print unknown flag
+        warn "Unknown option flag: $i"
         ;;
     esac
   done
@@ -176,7 +284,7 @@ function _readflags {
 ## Prints the full configuration for a dry run, as setup by everything else
 function _print_dry {
   echo DRY RUN INFO:
-  cat << EOF
+  read -d '' _info << EOF
   _dxvk_export = ${_dxvk_export}
   _esync_export = ${_esync_export}
   _fsync_export = ${_fsync_export}
@@ -185,8 +293,9 @@ function _print_dry {
   _strangle_cmd = ${_strangle_cmd}
   _strangle_fps_arg = ${_strangle_fps_arg}
   _strangle_vulkan_arg = ${_strangle_vulkan_arg}
+  _sdl_driver = ${_sdl_driver}
+  _tmp_dir = ${_tmp_dir}
 
-  _mango_tmp_dir = ${_mango_tmp_dir}
   _mango_live = ${_mango_live}
   _mango_conf_dir = ${_mango_conf_dir}
   _mango_lx = ${_mango_lx}
@@ -196,6 +305,7 @@ function _print_dry {
   _mango_conf_used = ${_mango_conf_used}
   _mango_cmd = ${_mango_cmd}
   _mango_dlsym_arg = ${_mango_dlsym_arg}
+  _mango_cleanup = ${_mango_cleanup}
 
   _any = ${_any}
   _dxvk_state = ${_dxvk_state}
@@ -206,6 +316,7 @@ function _print_dry {
   _fsync_force = ${_fsync_force}
   _log_state = ${_log_state}
   _log_force = ${_log_force}
+  _sdl_state = ${_sdl_state}
   _gamemode_state = ${_gamemode_state}
   _gamemode_block = ${_gamemode_block}
   _strangle_state = ${_strangle_state}
@@ -216,6 +327,7 @@ function _print_dry {
   _mango_block = ${_mango_block}
   _mango_level_set = ${_mango_level_set}
   _mango_level = ${_mango_level}
+  _mango_force_cleanup = ${_mango_force_cleanup}
   _dry_run = ${_dry_run}
 
   _full_cmd = ${_full_cmd}
@@ -227,8 +339,12 @@ function _print_dry {
     PROTON_NO_FSYNC = ${PROTON_NO_FSYNC}
     PROTON_LOG = ${PROTON_LOG}
     MANGOHUD_CONFIGFILE = ${MANGOHUD_CONFIGFILE}
+    SDL_VIDEODRIVER = ${SDL_VIDEODRIVER}
     ${_full_cmd} "$@"
 EOF
+  echo "  $_info"
+  dbglog "__NODBGLVL__   $_info"
+  dbglog
 }
 ## Sets MangoHud config level
 function _mango_level_set {
@@ -238,69 +354,87 @@ function _mango_level_set {
   fi
   # Check if config level has been set before and print warning if so
   if [[ $_mango_level_set -eq 1 ]]; then
-    echo "[WARN] MangoHud level was already set to $_mango_level, but it will now be overwritten to $1"
+    warn "MangoHud level was already set to $_mango_level, but it will now be overwritten to $1"
   fi
   # Set config level and the flag to signal this has already been done once
+  vmsg "Setting MangoHud level to $1"
   _mango_level_set=1
   _mango_level=$1
 }
 ## Sets up the command that we're going to run
 function _setup_cmd {
   # If no options have been given, we enable all defaults
-  if [[ ! $_any -eq 1 ]]; then
-    _dxvk_state=1
-    _esync_state=1
-    _fsync_state=1
-    _gamemode_state=1
-    _strangle_state=1
-    _mango_state=1
-  fi
+  _try_enable_all
   # Enable GameMode
   if [[ $_gamemode_state -eq 1 ]] && [[ $_gamemode_block -ne 1 ]]; then
+    vmsg "Appending GameMode wrapper"
     _full_cmd="${_full_cmd} ${_gamemode_cmd}"
   fi
   # Enable LibStrangle
   if [[ $_strangle_state -eq 1 ]] && [[ $_strangle_block -ne 1 ]]; then
+    vmsg "Appending LibStrangle wrapper"
     _full_cmd="${_full_cmd} ${_strangle_cmd} ${_strangle_fps_arg}"
     # Enable LibStrangle Vulkan-only flag
     if [[ $_strangle_vulkan -eq 1 ]]; then
+      vmsg "Appending LibStrangle Vulkan only argument"
       _full_cmd="${_full_cmd} ${_strangle_vulkan_arg}"
     fi
   fi
   # Enable DXVK export
   if [[ $_dxvk_state -eq 1 ]]; then
     if [[ -z $DXVK_ASYNC ]] || [[ $_dxvk_force -eq 1 ]]; then
+      vmsg "Adding DXVK_ASYNC to exports"
       _exports=(${_exports[@]} ${_dxvk_export})
     fi
   fi
   # Enable PROTON_NO_ESYNC export
   if [[ $_esync_state -eq 1 ]]; then
     if [[ -z $PROTON_NO_ESYNC ]] || [[ $_esync_force -eq 1 ]]; then
+      vmsg "Adding PROTON_NO_ESYNC to exports"
       _exports=(${_exports[@]} ${_esync_export})
     fi
   fi
   # Enable PROTON_NO_FSYNC export
   if [[ $_fsync_state -eq 1 ]]; then
     if [[ -z $PROTON_NO_FSYNC ]] || [[ $_fsync_force -eq 1 ]]; then
+      vmsg "Adding PROTON_NO_FSYNC to exports"
       _exports=(${_exports[@]} ${_fsync_export})
     fi
   fi
   # Enable PROTON_LOG export
   if [[ $_log_state -eq 1 ]]; then
     if [[ -z $PROTON_LOG ]] || [[ $_log_force -eq 1 ]]; then
+      vmsg "Adding PROTON_LOG to exports"
       _exports=(${_exports[@]} ${_log_export})
+    fi
+  fi
+  # Enable SDL_VIDEODRIVER export
+  if [[ $_sdl_state -eq 1 ]]; then
+    if [[ "${_sdl_driver}" == "-1" ]]; then
+      vmsg "Unsetting SDL_VIDEODRIVER"
+      unset SDL_VIDEODRIVER
+    else
+      vmsg "Adding SDL_VIDEODRIVER to exports"
+      _exports=(${_exports[@]} "SDL_VIDEODRIVER=${_sdl_driver}")
     fi
   fi
   # Enable MangoHud
   if [[ $_mango_state -eq 1 ]] && [[ $_mango_block -ne 1 ]]; then
+    vmsg "Appending MangoHud wrapper"
     _full_cmd="${_full_cmd} ${_mango_cmd}"
     # Enable MangoHud DLSYM flag
     if [[ $_mango_dlsym -eq 1 ]]; then
+      vmsg "Appending MangoHud DLSYM argument"
       _full_cmd="${_full_cmd} ${_mango_dlsym_arg}"
     fi
+    # Adding MangoHud config file to exports
     if [[ -z $MANGOHUD_CONFIGFILE ]] && [[ $_mango_conf_avail -eq 1 ]]; then
+      vmsg "Adding MANGOHUD_CONFIGFILE to exports"
       _exports=(${_exports[@]} ${_mango_export})
+    elif [[ -z $MANGOHUD_CONFIGFILE ]] && [[ $_mango_conf_avail -eq 0 ]]; then
+      warn "We couldn't find all of MangoHud's config presets. We're not going to export MANGOHUD_CONFIGFILE. This will leave MangoHud using its default config file (if it exists)."
     else
+      vmsg "Flagging that we didn't set up MangoHud's config file ourselves"
       _mango_conf_used=0
     fi
   fi
@@ -315,43 +449,63 @@ function _mango_cp {
       if [[ $_dry_run -eq 0 ]]; then
         # Copy the set MangoHud config file
         cp ${_mango_lx}${_mango_level} ${_mango_live}
-        echo Copied Mango L${_mango_level}
+        vmsg "Copied Mango L${_mango_level}"
       else
         # Print what we would've copied
-        echo "[DRY RUN] Would've copied ${_mango_lx}${_mango_level} to ${_mango_live}"
+        _msg="[DRY RUN] Would've copied ${_mango_lx}${_mango_level} to ${_mango_live}"
+        echo "$_msg"
+        dbglog "__NODBGLVL__ $_msg"
       fi
     # Default to level 0 for invalid config levels -- most likely can't be triggered without setting _mango_level to an invalid level in the code
     else
       echoerr "MangoHud level invalid: $_mango_level. MangoHud will default to level 0."
       cp "${_mango_lx}0" ${_mango_live}
-      echo Copied Mango L0
+      vmsg "Copied Mango L0"
     fi
   fi
 }
 ## Remove MangoHud live config file
 function _mango_rm {
-  if [[ $_mango_state -eq 1 ]] && [[ $_mango_conf_avail -eq 1 ]] && [[ $_mango_conf_used -eq 1 ]]; then
+  # Check that MangoHud was enabled, config files were available, config files were used, and that automatic cleanup was enabled
+  if [[ $_mango_state -eq 1 ]] && [[ $_mango_conf_avail -eq 1 ]] && [[ $_mango_conf_used -eq 1 ]] && [[ $_mango_cleanup -eq 1 ]]; then
+    # Check that live config file exists
     if [[ -f ${_mango_live} ]]; then
-      rm -v ${_mango_live}
+      vmsg "Removing MangoHud's config file from ${_mango_live}"
+      vmsg "$(rm -v ${_mango_live})"
+    fi
+  elif [[ ! -z $1 ]]; then
+    vmsg "Skipping checks about if we should cleanup MangoHud config, as requested by forced cleanup"
+    if [[ -f ${_mango_live} ]]; then
+      vmsg "Removing MangoHud's config file from ${_mango_live}"
+      vmsg "$(rm -v ${_mango_live})"
     fi
   fi
 }
 ## Loop through exports enabled by _readflags and export them
 function _export_all {
   for e in ${_exports[@]}; do
+    vmsg "Exporting $e"
     export $e
   done
 }
 ## Either run our command or print the dry run results
 function _go {
   # Export what was setup by _readflags
+  vmsg "Exporting all variables that have been set up"
   _export_all
   # Check we're not in a dry run, assuming dry run for unknown values
   if [[ $_dry_run -eq 0 ]]; then
-    # Run everything -- the $@ being in quotes seems to be required for proper function, as removing the quotes resulted in Steam being unable to launch any Proton game I tested
+    # Logging a bunch of info about what we're about to run
+    dbglog "${_full_cmd} \"$@\""
+    dbglog "DXVK_ASYNC=${DXVK_ASYNC} PROTON_NO_ESYNC=${PROTON_NO_ESYNC} PROTON_NO_FSYNC=${PROTON_NO_FSYNC} MANGOHUD_CONFIGFILE=${MANGOHUD_CONFIGFILE} SDL_VIDEODRIVER=${SDL_VIDEODRIVER}"
+    dbglog
+    dbglog "$(env)"
+    vmsg "No dry-run. We're going"
+    # Run everything -- the $@ being in quotes seems to be required for proper function, as removing the quotes resulted in Steam being unable to launch any Proton game I tested. Might just be because Proton games end up having '--' in their command
     ${_full_cmd} "$@"
   else
     # Print the dry run results
+    vmsg "[DRY RUN]   Printing dry-run info"
     _print_dry "$@"
   fi
 }
@@ -360,18 +514,26 @@ function _help {
   cat << EOF
 Intended to simplify launching games with wrappers and environment variables
 
-Usage:  $(basename $0) [--help] [-f <x>] [+defgklmnsy01234DEFGKLMSY] <command>
-
---help, -h, -? : Prints this message
-
--f <x> : Sets x as the framerate limit given to LibStrangle. Value must be a positive integer
+Usage:  $(_name 1) [--help] [-f <x>] [-S <val>|-s] [-v] [+defgklmnsy01234DEFGKLMSY] <command>
+Usage:  $(_name 1) [-options] [+feature flags] <command>
 
 Options:
+  --help, -h, -? : Prints this message
+  --helpmore, -hh, -?? : Prints an extending help message with notes about tested games/special cases
+
+  -f <x> : Sets x as the framerate limit given to LibStrangle. Value must be a positive integer
+  -s : Sets the value of SDL_VIDEODRIVER to "x11,windows"
+  -S <val> : Sets val as the value of SDL_VIDEODRIVER. Set value to -1 to unset variable
+  -v : Enable verbose messages and debug log file (${_debug_file})
+
+Feature Flags:
   - None: Defaults enabled
+  - c : Enable forced MangoHud temp config file cleanup
   - d : Set DXVK_ASYNC env var to 1
   - e : Set PROTON_NO_ESYNC env var to 1
   - f : Set PROTON_NO_FSYNC env var to 1
   - g : Enable GameMode wrapper command
+  - i : Enable automatic MangoHud config cleanup
   - k : Enable LibStrangle Vulkan-only flag
   - l : Set PROTON_LOG env var to 1
   - m : Enable MangoHud wrapper, with custom config file path to allow dynamically changing overlay layout
@@ -379,10 +541,12 @@ Options:
   - s : Enable LibStrangle wrapper command
   - y : Enable MangoHud DLSYM flag
   - 0-4 : Start MangoHud with specified detail level
+  - C : Disable forced MangoHud temp config file cleanup
   - D : DXVK_ASYNC env var will not be set
   - E : PROTON_NO_ESYNC env var will not be set
   - F : PROTON_NO_FSYNC env var will not be set
   - G : Disable GameMode wrapper command
+  - I : Disable MangoHud automatic config cleanup
   - K : Disable LibStrangle Vulkan-only flag
   - L : PROTON_LOG env var will not be set
   - M : Disable MangoHud wrapper command
@@ -401,78 +565,103 @@ Default options:
   - MangoHud: Enabled
   - MangoHud DLSYM: Disabled
   - MangoHud config level: 0
+  - MangoHud automatic config cleanup: Enabled
+  - MangoHud config forced cleanup: Disabled
 
 Options for disabling features are best used alone, as that way they can allow for easily enabling everything except certain items
 
-Note: Options to enable and disable features will override their counterpart, and the last of each pair will be in effect. Example: '+dD' would result in DXVK_ASYNC not being exported
+Note: Options to enable and disable features will override their counterpart, and the last of each pair to appear will be in effect. Example: '+dD' would result in DXVK_ASYNC not being exported
 
-Steam Launch Options example: '$(basename $0) %command%'
+Steam Launch Options example: '$(_name 1) %command%'
 EOF
-  exit 0
+  if [[ -z $1 ]]; then
+    exit 0
+  fi
+}
+function _helpmore {
+  cat << EOF
+
+## Extended help ##
+
+SDL_VIDEODRIVER:
+  - Some games take issue with SDL_VIDEODRIVER being set to "wayland". For some games, setting this to "wayland,x11" is enough to fix any issues. For some games (especially FNA titles), still defaulting to Wayland will not fix the issues. Some other games (specifically Back 4 Blood) will fail to launch if this variable does not contain "windows". To fix these issues, the simple SDL Driver flag for $(_name) (-s) will default to setting SDL_VIDEODRIVER to "x11,windows", as this setting seems to have the best compatibility across the board.
+
+Back 4 Blood:
+  - Appears to require SDL_VIDEODRIVER to be either unset or contain "windows" to avoid EAC Launcher "Failed to initialize dependencies" error. Setting the "-s" flag for $(_name) works.
+
+FNA Titles:
+  - Will have a garbled or absent Steam overlay if SDL_VIDEODRIVER is set to default to Wayland. Setting "-s" flag for $(_name) works.
+  - Had some other issues that I don't remember when attempting to launch FNA games. Appending "-gldevice:Vulkan" to launch options fixed the issue. No longer able to trigger issue when excluding said launch option. Appending said option would be good to try upon finding an issue ###
+  - Celeste requires SDL_VIDEODRIVER to be set to "x11" in order to successfully launch. Setting "-S x11" flag for $(_name) works.
+  - Celeste had a garbled Steam overlay by default. Appending "-gldevice:Vulkan" to launch options (NOT to $(_name)) fixes Steam overlay. Based on info reported by people across forums, this appears to be a common issue effecting FNA titles. A $(_name) option for appending said argument is not currently implemented.
+EOF
+  if [[ -z $1 ]]; then
+    exit 0
+  fi
 }
 ## Check each of the options is available, setting a blocking flag for any that can't be found / or are set up incorrectly
 function _check_available {
   # Check GameMode installed
   t=$(which gamemoderun 2>/dev/null)
   if [[ $? -ne 0 ]]; then
-    echo "[WARN] Cannot find gamemoderun in path, GameMode unavailable"
+    warn "Cannot find gamemoderun in path, GameMode unavailable"
     _gamemode_block=1
   else
+    vmsg "Setting GameMode path to $t"
     _gamemode_cmd="$t"
   fi
   # Check LibStrangle installed
   t=$(which strangle 2>/dev/null)
   if [[ $? -ne 0 ]]; then
-    echo "[WARN] Cannot find strangle in path, LibStrangle unavailable"
+    warn "Cannot find strangle in path, LibStrangle unavailable"
     _strangle_block=1
   else
+    vmsg "Setting LibStrangle path to $t"
     _strangle_cmd="$t"
   fi
   # Check MangoHud installed
   t=$(which mangohud 2>/dev/null)
   if [[ $? -ne 0 ]]; then
-    echo "[WARN] Cannot find mangohud in path, MangoHud unavailable"
+    warn "Cannot find mangohud in path, MangoHud unavailable"
     _mango_block=1
   elif [[ ! -d "$_mango_conf_dir" ]]; then # Check MangoHud config directory exists
-    echo "[WARN] MangoHud config directory doesn't exist at ${_mango_conf_dir}, MangoHud custom config unavailable"
-    # _mango_block=1
+    warn "MangoHud config directory doesn't exist at ${_mango_conf_dir}, MangoHud custom config unavailable"
     _mango_conf_avail=0
   elif [[ ! -e "${_mango_lx}0" ]]; then # Check MangoHud config for level 0 exists
-    echo "[WARN] Missing MangoHud config level 0 at ${_mango_lx}0, MangoHud custom config unavailable"
-    # _mango_block=1
+    warn "Missing MangoHud config level 0 at ${_mango_lx}0, MangoHud custom config unavailable"
     _mango_conf_avail=0
   elif [[ ! -e "${_mango_lx}1" ]]; then # Check MangoHud config for level 1 exists
-    echo "[WARN] Missing MangoHud config level 1 at ${_mango_lx}1, MangoHud custom config unavailable"
-    # _mango_block=1
+    warn "Missing MangoHud config level 1 at ${_mango_lx}1, MangoHud custom config unavailable"
     _mango_conf_avail=0
   elif [[ ! -e "${_mango_lx}2" ]]; then # Check MangoHud config for level 2 exists
-    echo "[WARN] Missing MangoHud config level 2 at ${_mango_lx}2, MangoHud custom config unavailable"
-    # _mango_block=1
+    warn "Missing MangoHud config level 2 at ${_mango_lx}2, MangoHud custom config unavailable"
     _mango_conf_avail=0
   elif [[ ! -e "${_mango_lx}3" ]]; then # Check MangoHud config for level 3 exists
-    echo "[WARN] Missing MangoHud config level 3 at ${_mango_lx}3, MangoHud custom config unavailable"
-    # _mango_block=1
+    warn "Missing MangoHud config level 3 at ${_mango_lx}3, MangoHud custom config unavailable"
     _mango_conf_avail=0
   elif [[ ! -e "${_mango_lx}4" ]]; then # Check MangoHud config for level 4 exists
-    echo "[WARN] Missing MangoHud config level 4 at ${_mango_lx}4, MangoHud custom config unavailable"
-    # _mango_block=1
+    warn "Missing MangoHud config level 4 at ${_mango_lx}4, MangoHud custom config unavailable"
     _mango_conf_avail=0
   else
+    vmsg "Setting MangoHud path to $t"
     _mango_cmd="$t"
   fi
 }
 
 # Main
+vmsg "---------- $(_name) Start ----------"
 ## Check command line options
 while true; do
   # Item starting with '+' declares options for what actions to apply
   if [[ "x$1" == "x+"* ]]; then
+    vmsg "Parsing feature flags: $1"
     _readflags $1
     shift
   # Check that there are more items on the command line
   elif [[ ! -z "$1" ]]; then
     # Flag '-f' declares framerate limit to give to LibStrangle
     if [[ "x$1" == "x-f" ]]; then
+      vmsg "Found LibStrangle framerate flag"
       # Check that something follows the framerate flag
       if [[ -z "$2" ]]; then
         echoerr "Framerate argument (-f) must be followed by a number"
@@ -483,6 +672,7 @@ while true; do
         exit 1
       # Set framerate limit for LibStrangle
       else
+        vmsg "Setting LibStrangle FPS to $2"
         _strangle_fps_arg="-f $2"
       fi
       shift
@@ -490,24 +680,71 @@ while true; do
     # Flags '-h', '-?', '--help' signal to show help message
     elif [[ "x$1" == "x-h" ]] || [[ "x$1" == "x--help" ]] || [[ "x$1" == "x-?" ]]; then
       _help
+    # Flag '-s' to set SDL_VIDEODRIVER
+    elif [[ "x$1" == "x-s" ]]; then
+      vmsg "Setting SDL driver to 'x11,windows'"
+      _sdl_state=1
+      _sdl_driver="x11,windows"
+      shift
+    # Flag '-S' to set SDL_VIDEODRIVER to a specified value
+    elif [[ "x$1" == "x-S" ]]; then
+      # Check that something follows the SDL driver flag
+      if [[ -z "$2" ]]; then
+        echoerr "No value given to set SDL Video Driver. Maybe you meant '-s'?"
+        exit 1
+      else
+        vmsg "Setting SDL driver to $2"
+        _sdl_state=1
+        _sdl_driver="$2"
+      fi
+      shift
+      shift
+    # Flag for debugging
+    elif [[ "x$1" == "x-v" ]]; then
+      vmsg "Enabling verbose messages and debug logging"
+      _verbose=1
+      shift
+    # Flags for showing extended help
+    elif [[ "x$1" == "x--helpmore" ]] || [[ "x$1" == "x-hh" ]] || [[ "x$1" == "x-??" ]]; then
+      _help 1
+      _helpmore
     # No understood flag, break loop to do setup and run given command
     else
+      vmsg "No more flags understood. Breaking flags loop."
       break
     fi
-  # No more items, break loop to do setup -- There wouldn't be a command being given here, so we may have odd behavior/crashing from wrapper commands unless this is a dry run 
+  # No more items, break loop to do setup -- There wouldn't be a command being given here, so we may have odd behavior/crashing from wrapper commands unless this is a dry run
   else
+    vmsg "No more arguments found. Invoked without a command? Breaking flags loop."
     break
   fi
 done
 ## Check each of the wrapper commands exist
+vmsg "Checking what wrappers are available"
 _check_available
 ## Setup the command we're going to execute
+vmsg "Setting up our command"
 _setup_cmd
 ## Copy the set MangoHud level config to _mango_live path
+vmsg "Copying MangoHud config level"
 _mango_cp
 ## Go for it
+vmsg "Attempting to run"
 _go "$@"
-## Cleanup MangoHud level config from _mango_live path
-_mango_rm
+## Check MangoHud cleanup
+if [[ $_mango_force_cleanup -eq 1 ]]; then
+  ## Cleanup MangoHud level config from _mango_live path
+  vmsg "Cleaning up MangoHud's config, as requested by forced cleanup"
+  _mango_rm 1
+else
+  ## Cleanup MangoHud config if no other instances are running
+  pids=($(pgrep $(_name 1)))
+  if [[ ${#pids[@]} -lt 2 ]]; then
+    vmsg "No other $(_name) instances found. Cleaning up MangoHud config file"
+    _mango_rm
+  else
+    vmsg "Another instance of $(_name) is running, we're going to skip cleaning up MangoHud's config file at ${_mango_live}"
+  fi
+fi
 
-echo "---------- GameLaunch Finish ---------"
+vmsg "---------- $(_name) Finish ---------"

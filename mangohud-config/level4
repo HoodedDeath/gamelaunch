@@ -1,5 +1,7 @@
 time
+
 version
+
 gpu_stats
 gpu_temp
 gpu_junction_temp
