@@ -256,6 +256,8 @@ B4B has always crashed in my testing unless `SDL_VIDEODRIVER` contains `windows`
 	- Crypt of the NecroDancer
 	- The Dishwasher: Vampire Smile
 	- Terraria (also fine with `-s`)
+   	- Stardew Valley
+   	- You Have to Win the Game
 
 # To-do / Possible future improvements
 - Config file for this script to pull default values from
